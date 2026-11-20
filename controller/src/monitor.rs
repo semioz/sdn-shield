@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use rovs_openflow::FlowStatsEntry;
@@ -18,11 +19,36 @@ struct Window {
     reset: usize,
     unsupported: usize,
     expired: usize,
+    source_packets: BTreeMap<Ipv4Addr, u64>,
 }
 
 impl Window {
     fn exceeds(&self, packet_limit: f64, byte_limit: f64) -> bool {
         self.packets_per_second > packet_limit || self.bytes_per_second > byte_limit
+    }
+
+    fn source_entropy_bits(&self) -> Option<f64> {
+        let total: f64 = self
+            .source_packets
+            .values()
+            .map(|&count| count as f64)
+            .sum();
+
+        if total == 0.0 {
+            return None;
+        }
+
+        let entropy = self
+            .source_packets
+            .values()
+            .filter(|&&count| count > 0)
+            .map(|&count| {
+                let probability = count as f64 / total;
+                -probability * probability.log2()
+            })
+            .sum();
+
+        Some(entropy)
     }
 }
 
@@ -78,6 +104,11 @@ fn measure(
         }
         let Some(old) = old else {
             window.new += 1;
+
+            if let Some(source_ip) = entry.match_fields.ipv4_src {
+                window.source_packets.insert(source_ip, entry.packet_count);
+            }
+
             continue;
         };
         if entry.packet_count < old.packet_count
@@ -87,14 +118,26 @@ fn measure(
             window.reset += 1;
             continue;
         }
+        let packet_delta = entry.packet_count - old.packet_count;
+
         window.packets = window
             .packets
-            .checked_add(entry.packet_count - old.packet_count)
+            .checked_add(packet_delta)
             .ok_or("aggregate packet counter overflow")?;
+
         window.bytes = window
             .bytes
             .checked_add(entry.byte_count - old.byte_count)
             .ok_or("aggregate byte counter overflow")?;
+
+        if let Some(source_ip) = entry.match_fields.ipv4_src {
+            let source_packets = window.source_packets.entry(source_ip).or_default();
+
+            *source_packets = source_packets
+                .checked_add(packet_delta)
+                .ok_or("source IP packet counter overflow")?;
+        }
+
         window.compared += 1;
     }
     for (key, entry) in &previous {
@@ -162,8 +205,25 @@ pub fn run(args: &[String]) -> Result<()> {
                 .join(":");
             let complete = window.new + window.reset + window.unsupported + window.expired == 0;
             let alarm = window.exceeds(packet_limit, byte_limit);
+            let source_count = window
+                .source_packets
+                .values()
+                .filter(|&&packets| packets > 0)
+                .count();
+            let source_ips = window
+                .source_packets
+                .iter()
+                .filter(|&(_, &packets)| packets > 0)
+                .map(|(ip, _)| ip.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let source_entropy = window
+                .source_entropy_bits()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "na".to_string());
             println!(
-                "SAMPLE window={number} destination={destination} observed_seconds={observed_seconds} elapsed_seconds={} packets={} bytes={} packets_per_second={} bytes_per_second={} compared={} new={} reset={} unsupported={} expired={} complete={} alarm={}",
+                "SAMPLE window={number} destination={destination} observed_seconds={observed_seconds} elapsed_seconds={} packets={} bytes={} packets_per_second={} bytes_per_second={} source_count={source_count} source_ips={source_ips} source_entropy_bits={source_entropy} compared={} new={} reset={} unsupported={} expired={} complete={} alarm={}",
                 elapsed.as_secs_f64(),
                 window.packets,
                 window.bytes,

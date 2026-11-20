@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use rovs_openflow::Match;
 
 use super::*;
@@ -20,7 +22,8 @@ fn flow(source: u8, packets: u64, bytes: u64, age: u32) -> FlowStatsEntry {
         match_fields: Match::new()
             .in_port(u32::from(source))
             .eth_src([0, 0, 0, 0, 0, source])
-            .eth_dst(DESTINATION),
+            .eth_dst(DESTINATION)
+            .ipv4_src(Ipv4Addr::new(10, 0, 0, source), 32),
         instructions: Vec::new(),
     }
 }
@@ -130,4 +133,32 @@ fn rejects_aggregate_counter_overflow() {
     let before = [flow(1, 0, 0, 10), flow(2, 0, 0, 10)];
     let after = [flow(1, u64::MAX - 1, 10, 11), flow(2, 100, 100, 11)];
     assert!(measure(&before, &after, Duration::from_secs(1)).is_err());
+}
+#[test]
+fn entropy_is_zero_for_one_source_ip() {
+    let before = [flow(1, 0, 0, 10)];
+    let after = [flow(1, 100, 10000, 11)];
+
+    let windows = measure(&before, &after, Duration::from_secs(1)).unwrap();
+    let entropy = windows[&DESTINATION].source_entropy_bits().unwrap();
+
+    assert!((entropy - 0.0).abs() < 1e-9);
+}
+
+#[test]
+fn entropy_is_one_for_two_equally_active_source_ips() {
+    let before = [flow(1, 0, 0, 10), flow(2, 0, 0, 10)];
+    let after = [flow(1, 100, 10000, 11), flow(2, 100, 10000, 11)];
+
+    let windows = measure(&before, &after, Duration::from_secs(1)).unwrap();
+    let entropy = windows[&DESTINATION].source_entropy_bits().unwrap();
+
+    assert!((entropy - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn entropy_is_none_when_there_is_no_source_ip_traffic() {
+    let window = Window::default();
+
+    assert_eq!(window.source_entropy_bits(), None);
 }
