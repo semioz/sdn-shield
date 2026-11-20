@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::time::Duration;
 
 mod control;
@@ -39,7 +39,38 @@ fn send(stream: &mut impl Write, message: Message) -> Result<()> {
     stream.write_all(&message.encode())?;
     Ok(())
 }
+fn ipv4_addresses(frame: &[u8]) -> Result<Option<(Ipv4Addr, Ipv4Addr)>> {
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
 
+    // This packet is not IPv4.
+    if ethertype != 0x0800 {
+        return Ok(None);
+    }
+
+    // An IPv4 header must be at least 20 bytes.
+    if frame.len() < 34 {
+        return Err("IPv4 packet has an incomplete header".into());
+    }
+
+    let version = frame[14] >> 4;
+    let header_length = usize::from(frame[14] & 0x0f) * 4;
+
+    if version != 4 || header_length < 20 || frame.len() < 14 + header_length {
+        return Err("invalid IPv4 header".into());
+    }
+
+    let total_length = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+
+    if total_length < header_length {
+        return Err("invalid IPv4 total length".into());
+    }
+
+    let source = Ipv4Addr::new(frame[26], frame[27], frame[28], frame[29]);
+
+    let destination = Ipv4Addr::new(frame[30], frame[31], frame[32], frame[33]);
+
+    Ok(Some((source, destination)))
+}
 fn forward(
     stream: &mut TcpStream,
     packet: PacketIn,
@@ -63,6 +94,7 @@ fn forward(
     if [0x8100, 0x88a8].contains(&u16::from_be_bytes([packet.data[12], packet.data[13]])) {
         return Err("VLAN-tagged traffic is outside this untagged lab prototype".into());
     }
+    let ipv4 = ipv4_addresses(&packet.data)?;
     if !macs.contains_key(&source) && macs.len() >= MAX_MACS {
         return Err("MAC learning table capacity reached".into());
     }
@@ -76,18 +108,26 @@ fn forward(
         return Ok(());
     }
     if let Some(output) = output {
+        let mut match_fields = Match::new()
+            .in_port(port)
+            .eth_src(source)
+            .eth_dst(destination);
+
+        if let Some((ipv4_source, ipv4_destination)) = ipv4 {
+            match_fields = match_fields
+                .eth_type(0x0800)
+                .ipv4_src(ipv4_source, 32)
+                .ipv4_dst(ipv4_destination, 32);
+        }
+
         let flow = Flow::add()
             .cookie(COOKIE)
             .priority(1)
             .idle_timeout(30)
             .hard_timeout(60)
-            .match_fields(
-                Match::new()
-                    .in_port(port)
-                    .eth_src(source)
-                    .eth_dst(destination),
-            )
+            .match_fields(match_fields)
             .actions(ActionList::new().output(output));
+
         send(stream, flow.to_message(Version::Of13, xid))?;
     }
     let actions = ActionList::new().output(output.map_or(OutputPort::Flood, OutputPort::Port));

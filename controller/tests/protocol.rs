@@ -108,6 +108,15 @@ fn packet_in(port: u32, source: [u8; 6], destination: [u8; 6]) -> Vec<u8> {
     ethernet.extend_from_slice(&source);
     ethernet.extend_from_slice(&[0x08, 0x00]);
     ethernet.resize(60, 0);
+
+    // Add a valid IPv4 header after the 14-byte Ethernet header.
+    ethernet[14] = 0x45; // IPv4, 20-byte header
+    ethernet[16..18].copy_from_slice(&46u16.to_be_bytes());
+    ethernet[22] = 64; // TTL
+    ethernet[23] = 6; // TCP
+    ethernet[26..30].copy_from_slice(&[10, 0, 0, 1]);
+    ethernet[30..34].copy_from_slice(&[10, 0, 0, 2]);
+
     let mut body = u32::MAX.to_be_bytes().to_vec();
     body.extend_from_slice(&(ethernet.len() as u16).to_be_bytes());
     body.extend_from_slice(&[0; 10]);
@@ -117,7 +126,6 @@ fn packet_in(port: u32, source: [u8; 6], destination: [u8; 6]) -> Vec<u8> {
     body.extend_from_slice(&ethernet);
     frame(10, 50, &body)
 }
-
 #[test]
 fn handshake_echo_and_reconnect() {
     let controller = Controller::start();
